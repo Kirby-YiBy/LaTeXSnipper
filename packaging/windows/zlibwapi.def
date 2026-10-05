@@ -1,0 +1,132 @@
+; Export definition for the bundled zlibwapi.dll (Windows x64).
+;
+; WHY THIS FILE EXISTS
+; --------------------
+; cuDNN 8 on Windows imports zlibwapi.dll BY ORDINAL, not by name. On CUDA 11.8
+; + cuDNN 8.x the four imports are:
+;
+;     ordinal 6  -> deflateEnd
+;     ordinal 19 -> inflate
+;     ordinal 20 -> inflateEnd
+;     ordinal 21 -> inflateInit2_
+;
+; Export ordinals are therefore an ABI contract, not an implementation detail.
+;
+; The ordering below reproduces the legacy zlib 1.1.x-era export layout that
+; Gilles Vollant's zlibwapi.dll has carried for ABI stability ever since. It is
+; the layout cuDNN was built against.
+;
+; Do NOT substitute the ordering from zlib's own win32/zlib.def, which starts
+; with zlibVersion and differs from the legacy layout from ordinal 1 onward.
+; Building with that file produces a DLL that still LOADS but resolves to the
+; wrong functions -- e.g. ordinal 6 would be deflateSetDictionary rather than
+; deflateEnd, so cuDNN would call deflateSetDictionary through the deflateEnd
+; signature. That is silent memory corruption, strictly worse than a load
+; failure. scripts/verify_zlibwapi_ordinals.py guards against this.
+;
+; Ordinals 52..60 are reserved (unused) and 61+ belong to minizip in Vollant's
+; build. We do not ship minizip, so those stay unassigned rather than being
+; renumbered -- renumbering would break the ABI for any future ordinal import.
+; Functions added after zlib 1.2.11 are assigned ordinals from 100 upward so
+; they can never shift a legacy ordinal.
+
+EXPORTS
+    ; ---- Legacy ABI: ordinals 1..51 (order is fixed, do not reorder) ----
+    adler32 @1
+    compress @2
+    crc32 @3
+    deflate @4
+    deflateCopy @5
+    deflateEnd @6
+    deflateInit2_ @7
+    deflateInit_ @8
+    deflateParams @9
+    deflateReset @10
+    deflateSetDictionary @11
+    gzclose @12
+    gzdopen @13
+    gzerror @14
+    gzflush @15
+    gzopen @16
+    gzread @17
+    gzwrite @18
+    inflate @19
+    inflateEnd @20
+    inflateInit2_ @21
+    inflateInit_ @22
+    inflateReset @23
+    inflateSetDictionary @24
+    inflateSync @25
+    uncompress @26
+    zlibVersion @27
+    gzprintf @28
+    gzputc @29
+    gzgetc @30
+    gzseek @31
+    gzrewind @32
+    gztell @33
+    gzeof @34
+    gzsetparams @35
+    zError @36
+    inflateSyncPoint @37
+    get_crc_table @38
+    compress2 @39
+    gzputs @40
+    gzgets @41
+    inflateCopy @42
+    inflateBackInit_ @43
+    inflateBack @44
+    inflateBackEnd @45
+    compressBound @46
+    deflateBound @47
+    gzclearerr @48
+    gzungetc @49
+    zlibCompileFlags @50
+    deflatePrime @51
+
+    ; ---- Additions from zlib 1.3.2 (ordinals 100+, no legacy ABI) ----
+    deflateGetDictionary @100
+    deflateTune @101
+    deflateBound_z @102
+    deflatePending @103
+    deflateUsed @104
+    deflateSetHeader @105
+    inflateGetDictionary @106
+    inflateReset2 @107
+    inflatePrime @108
+    inflateMark @109
+    inflateGetHeader @110
+    compress_z @111
+    compress2_z @112
+    compressBound_z @113
+    uncompress2 @114
+    uncompress_z @115
+    uncompress2_z @116
+    gzbuffer @117
+    gzfread @118
+    gzfwrite @119
+    gzvprintf @120
+    gzoffset @121
+    gzdirect @122
+    gzclose_r @123
+    gzclose_w @124
+    gzopen64 @125
+    gzseek64 @126
+    gztell64 @127
+    gzoffset64 @128
+    adler32_combine64 @129
+    crc32_combine64 @130
+    crc32_combine_gen64 @131
+    adler32_z @132
+    crc32_z @133
+    adler32_combine @134
+    crc32_combine @135
+    crc32_combine_gen @136
+    crc32_combine_op @137
+    gzgetc_ @138
+    inflateUndermine @139
+    inflateValidate @140
+    inflateCodesUsed @141
+    inflateResetKeep @142
+    deflateResetKeep @143
+    gzopen_w @144

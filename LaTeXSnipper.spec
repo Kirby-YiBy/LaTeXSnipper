@@ -343,6 +343,23 @@ if not bundled_python:
 bundled_python = Path(bundled_python).resolve()
 if not (bundled_python / "python.exe").is_file():
     raise RuntimeError(f"Bundled Python seed is missing python.exe: {bundled_python}")
+
+# cuDNN 8 imports zlibwapi.dll by ordinal from its convolver DLL. Without it the
+# GPU backend reports CUDA as ready and then dies with STATUS_STACK_BUFFER_OVERRUN
+# on the first convolution, so a build missing it must not be produced at all.
+# The DLL is built from official zlib source into the seed by
+# scripts/build_github_release_installer.ps1.
+_zlibwapi = bundled_python / "zlibwapi.dll"
+if not _zlibwapi.is_file():
+    raise RuntimeError(
+        "Bundled Python seed is missing zlibwapi.dll: "
+        f"{_zlibwapi}\n"
+        "The Windows GPU backend cannot run without it. Build the installer with "
+        "scripts/build_github_release_installer.ps1, which compiles it from official "
+        "zlib source and installs it into the seed, or run the zlib build step for "
+        "your seed manually."
+    )
+
 extra_datas += _collect_tree_as_datas(bundled_python, "deps/python311")
 
 

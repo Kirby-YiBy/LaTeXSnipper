@@ -62,8 +62,24 @@ def test_windows_bundle_collects_explicit_seed_path(tmp_path, monkeypatch):
     seed = tmp_path / "runner inputs" / "python seed"
     seed.mkdir(parents=True)
     (seed / "python.exe").touch()
+    (seed / "zlibwapi.dll").touch()
     monkeypatch.setenv("LATEXSNIPPER_BUNDLED_PYTHON", str(seed))
     assert run_seed_collection() == [(seed.resolve(), "deps/python311")]
+
+
+def test_windows_bundle_requires_zlibwapi_for_the_gpu_backend(tmp_path, monkeypatch):
+    """cuDNN 8 imports zlibwapi.dll by ordinal from its convolver DLL.
+
+    Without it the shipped GPU backend reports CUDA as ready and then dies with
+    STATUS_STACK_BUFFER_OVERRUN on the first convolution, so the seed must not
+    be accepted without it.
+    """
+    seed = tmp_path / "python seed"
+    seed.mkdir(parents=True)
+    (seed / "python.exe").touch()
+    monkeypatch.setenv("LATEXSNIPPER_BUNDLED_PYTHON", str(seed))
+    with pytest.raises(RuntimeError, match="missing zlibwapi.dll"):
+        run_seed_collection()
 
 
 def test_windows_bundle_requires_usable_seed(tmp_path, monkeypatch):

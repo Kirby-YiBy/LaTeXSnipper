@@ -215,6 +215,9 @@ class TestDependencyInstallation(unittest.TestCase):
         bin_dir.mkdir(parents=True)
         for name in (
             "cudnn64_8.dll",
+            "cudnn_cnn_infer64_8.dll",
+            "cudnn_ops_infer64_8.dll",
+            "zlibwapi.dll",
             "cudart64_110.dll",
             "cublas64_11.dll",
             "cublasLt64_11.dll",
@@ -236,7 +239,92 @@ class TestDependencyInstallation(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertIn("cudart64_110.dll", dll_names)
         self.assertIn("cudnn64_8.dll", dll_names)
+        self.assertIn("zlibwapi.dll", dll_names)
         self.assertNotIn("cudart64_12.dll", dll_names)
+
+    def test_cuda11_requirements_include_cudnn8_transitive_zlib(self):
+        """cuDNN 8 convolver DLLs import zlibwapi.dll, so it must be required.
+
+        Omitting it is what let a host report CUDA as ready and then die on the
+        first convolution with STATUS_STACK_BUFFER_OVERRUN.
+        """
+        from backend.mathcraft.runtime_policy import CudaRuntimeInfo, cuda_dll_requirements
+
+        names = [req.display_name for req in cuda_dll_requirements(CudaRuntimeInfo(major=11, minor=8, source="test"))]
+
+        self.assertIn("zlibwapi.dll", names)
+        self.assertIn("cudnn_cnn_infer64_8.dll", names)
+        self.assertIn("cudnn_ops_infer64_8.dll", names)
+
+    def test_cuda12_requirements_do_not_require_legacy_zlibwapi(self):
+        """cuDNN 9 does not carry the zlibwapi dependency, so it must not be required."""
+        from backend.mathcraft.runtime_policy import CudaRuntimeInfo, cuda_dll_requirements
+
+        names = [req.display_name for req in cuda_dll_requirements(CudaRuntimeInfo(major=12, minor=0, source="test"))]
+
+        self.assertNotIn("zlibwapi.dll", names)
+
+    def test_gpu_verify_probe_loads_cudnn_libraries(self):
+        """The GPU probe must load cuDNN, not merely create a session.
+
+        Creating an ONNX session on CUDAExecutionProvider never loads cuDNN --
+        it is pulled in lazily on the first convolution. A host missing a cuDNN
+        dependency (notably zlibwapi.dll, imported by cuDNN 8's convolver DLL on
+        Windows) therefore passed verification and then died with 0xC0000409 on
+        the first real recognition.
+        """
+        from backend.mathcraft.runtime_policy import DllRequirement
+        from bootstrap import deps_runtime_verify
+
+        def _req(family, name):
+            return DllRequirement(family=family, display_name=name, patterns=(name,), expected_names=(name,))
+
+        requirements = (
+            _req("cudnn", "cudnn_cnn_infer64_8.dll"),
+            _req("zlib", "zlibwapi.dll"),
+        )
+        with mock.patch.object(deps_runtime_verify, "cuda_dll_requirements", return_value=requirements), \
+                mock.patch.object(deps_runtime_verify, "sys", mock.Mock(platform="win32")):
+            code = deps_runtime_verify._onnxruntime_session_verify_code(expect_gpu=True)
+
+        compile(code, "<gpu-verify>", "exec")
+        self.assertIn("LoadLibraryW", code)
+        self.assertIn("cudnn_cnn_infer64_8.dll", code)
+        self.assertIn("zlibwapi.dll", code)
+
+    def test_cpu_verify_probe_does_not_probe_cuda_libraries(self):
+        from bootstrap import deps_runtime_verify
+
+        code = deps_runtime_verify._onnxruntime_session_verify_code(expect_gpu=False)
+
+        compile(code, "<cpu-verify>", "exec")
+        self.assertNotIn("LoadLibraryW", code)
+
+    def test_cudnn_load_failure_message_is_classified_as_cuda_error(self):
+        """The probe's failure text must route to the CUDA diagnostics, not UNKNOWN."""
+        from backend.mathcraft.diagnostics import classify_mathcraft_failure
+        from backend.mathcraft.runtime_policy import DllRequirement
+        from bootstrap import deps_runtime_verify
+
+        requirements = (
+            DllRequirement(
+                family="cudnn",
+                display_name="cudnn_cnn_infer64_8.dll",
+                patterns=("cudnn_cnn_infer64_8.dll",),
+                expected_names=("cudnn_cnn_infer64_8.dll",),
+            ),
+        )
+        with mock.patch.object(deps_runtime_verify, "cuda_dll_requirements", return_value=requirements), \
+                mock.patch.object(deps_runtime_verify, "sys", mock.Mock(platform="win32")):
+            code = deps_runtime_verify._onnxruntime_session_verify_code(expect_gpu=True)
+
+        message = [line for line in code.splitlines() if "failed to load" in line]
+        self.assertTrue(message, "probe must raise a load-failure message")
+        info = classify_mathcraft_failure(
+            "cuDNN runtime libraries failed to load, so the GPU backend cannot run inference: "
+            "cudnn_cnn_infer64_8.dll (WinError 126)"
+        )
+        self.assertEqual(info["code"], "CUDA_RUNTIME_BROKEN")
 
     def test_cuda_shared_library_diagnostics_checks_linux_so_names(self):
         from backend.mathcraft.cuda_diagnostics import diagnose_cuda_shared_libraries

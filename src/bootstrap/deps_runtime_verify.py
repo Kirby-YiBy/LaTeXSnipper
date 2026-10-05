@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from backend.mathcraft.runtime_policy import onnxruntime_gpu_policy
+from backend.mathcraft.runtime_policy import cuda_dll_requirements, onnxruntime_gpu_policy
 from bootstrap.deps_context import (
     PIP_INSTALL_SUPPRESS_ARGS,
     flags,
@@ -284,6 +284,52 @@ def _latexsnipper_config_path():
 """
 
 
+def _cuda_dll_load_check_code(*, expect_gpu: bool) -> str:
+    """Generate the snippet that proves the CUDA/cuDNN libraries can be loaded.
+
+    Creating an ONNX Runtime session on CUDAExecutionProvider does not load
+    cuDNN. cuDNN is pulled in lazily the first time a convolution runs, so a
+    host that is missing a cuDNN dependency still reports CUDA as ready and
+    then dies inside the native library on the first real inference -- on
+    Windows that surfaces as exit code 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN),
+    which carries no Python traceback because the process is killed outright.
+
+    The dependency that bit us is zlibwapi.dll: cuDNN 8's convolver DLL
+    (cudnn_cnn_infer64_8.dll) imports it, and it is absent from a stock CUDA
+    install.
+
+    LoadLibraryW is the same call ONNX Runtime's own delay-load resolution
+    makes, so this reproduces the real search order (application directory,
+    System32, PATH) instead of a more forgiving one.
+    """
+    if not expect_gpu or sys.platform != "win32":
+        return ""
+    names = tuple(
+        requirement.display_name
+        for requirement in cuda_dll_requirements()
+        if "*" not in requirement.display_name
+    )
+    if not names:
+        return ""
+    return f"""
+_required_dlls = {names!r}
+_abi_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_abi_load_library = _abi_kernel32.LoadLibraryW
+_abi_load_library.argtypes = [ctypes.c_wchar_p]
+_abi_load_library.restype = ctypes.c_void_p
+_unloadable = []
+for _dll_name in _required_dlls:
+    if not _abi_load_library(_dll_name):
+        _unloadable.append("{{}} (WinError {{}})".format(_dll_name, ctypes.get_last_error()))
+if _unloadable:
+    raise RuntimeError(
+        "cuDNN runtime libraries failed to load, so the GPU backend cannot run "
+        "inference: " + ", ".join(_unloadable)
+    )
+print("CUDA/cuDNN libraries loaded:", ", ".join(_required_dlls))
+"""
+
+
 def _onnxruntime_session_verify_code(*, expect_gpu: bool) -> str:
     expected_provider = "CUDAExecutionProvider" if expect_gpu else "CPUExecutionProvider"
     requested_providers = (
@@ -292,7 +338,9 @@ def _onnxruntime_session_verify_code(*, expect_gpu: bool) -> str:
         else "['CPUExecutionProvider']"
     )
     layer_name = "MATHCRAFT_GPU" if expect_gpu else "MATHCRAFT_CPU"
+    dll_check = _cuda_dll_load_check_code(expect_gpu=expect_gpu)
     return f"""
+{dll_check}
 import onnxruntime as ort
 
 
@@ -365,6 +413,10 @@ print("{layer_name} OK")
 
 
 LAYER_VERIFY_CODE = {
+    # MATHCRAFT_CPU / MATHCRAFT_GPU are generated on demand rather than built
+    # here: their code depends on the detected CUDA major, and importing this
+    # module must not probe the host for CUDA (that can spawn nvcc). See
+    # _DYNAMIC_LAYER_VERIFY_CODE below.
     "BASIC": """
 import PIL
 import requests
@@ -373,8 +425,6 @@ import lxml
 print("BASIC OK")
 """,
     "CORE": _CORE_VERIFY_CODE,
-    "MATHCRAFT_CPU": _onnxruntime_session_verify_code(expect_gpu=False),
-    "MATHCRAFT_GPU": _onnxruntime_session_verify_code(expect_gpu=True),
     "PANDOC": _CONFIG_PATH_SNIPPET + """
 import importlib.util, shutil, os, sys
 if importlib.util.find_spec("pypandoc") is None:
@@ -412,6 +462,14 @@ print("PANDOC OK")
 }
 
 
+# Layers whose verification source is built per run. Deferred because generating
+# it reads the host's CUDA environment.
+_DYNAMIC_LAYER_VERIFY_CODE = {
+    "MATHCRAFT_CPU": lambda: _onnxruntime_session_verify_code(expect_gpu=False),
+    "MATHCRAFT_GPU": lambda: _onnxruntime_session_verify_code(expect_gpu=True),
+}
+
+
 def _verify_layer_runtime(pyexe: str, layer: str, timeout: int = 60) -> tuple:
     """Verify whether a feature layer works at runtime."""
     import subprocess
@@ -419,7 +477,9 @@ def _verify_layer_runtime(pyexe: str, layer: str, timeout: int = 60) -> tuple:
     if layer == "CORE":
         timeout = max(timeout, 120)
 
-    if layer in LAYER_VERIFY_CODE:
+    if layer in _DYNAMIC_LAYER_VERIFY_CODE:
+        code = _DYNAMIC_LAYER_VERIFY_CODE[layer]()
+    elif layer in LAYER_VERIFY_CODE:
         code = LAYER_VERIFY_CODE[layer]
     else:
 

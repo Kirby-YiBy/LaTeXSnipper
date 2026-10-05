@@ -276,6 +276,131 @@ function Remove-PythonCache {
         Remove-Item -Force
 }
 
+# --- zlibwapi.dll ---------------------------------------------------------
+# cuDNN 8 imports zlibwapi.dll by ordinal from its convolver DLL
+# (cudnn_cnn_infer64_8.dll). A stock CUDA/cuDNN install does not include it, and
+# without it the GPU backend reports CUDA as ready and then dies with
+# STATUS_STACK_BUFFER_OVERRUN on the first convolution.
+#
+# It is built here from official zlib source rather than vendored as a binary,
+# so the shipped DLL is reproducible and carries the export ordinals cuDNN
+# imports. packaging/windows/zlibwapi.def pins that ordinal layout.
+
+$ZlibVersion = "1.3.2"
+$ZlibSourceUri = "https://zlib.net/zlib-$ZlibVersion.tar.gz"
+$ZlibSourceSha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+
+$ZlibCompileUnits = @(
+    "adler32", "compress", "crc32", "deflate", "gzclose", "gzlib", "gzread",
+    "gzwrite", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr",
+    "zutil"
+)
+
+function Find-MsvcEnvironment {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        throw "vswhere.exe not found. Install Visual Studio Build Tools with the C++ x64 toolset to build zlibwapi.dll."
+    }
+    $installation = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $installation) {
+        throw "No Visual Studio installation providing the MSVC x64 toolset was found."
+    }
+    $vcvars = Join-Path $installation "VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path -LiteralPath $vcvars)) {
+        throw "vcvars64.bat not found under $installation"
+    }
+    return $vcvars
+}
+
+function Install-ZlibWapiDll {
+    param(
+        [Parameter(Mandatory = $true)][string]$SeedRoot,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$PythonExe
+    )
+
+    $defFile = Join-Path $RepoRoot "packaging\windows\zlibwapi.def"
+    if (-not (Test-Path -LiteralPath $defFile)) {
+        throw "zlibwapi export definition not found: $defFile"
+    }
+    $verifier = Join-Path $RepoRoot "tools\verify_zlibwapi_ordinals.py"
+    if (-not (Test-Path -LiteralPath $verifier)) {
+        throw "zlibwapi ordinal verifier not found: $verifier"
+    }
+
+    $vcvars = Find-MsvcEnvironment
+    $work = Join-Path $env:RUNNER_TEMP ("latexsnipper-zlib-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $archive = Join-Path $work "zlib.tar.gz"
+        Write-Host "Fetching official zlib $ZlibVersion source: $ZlibSourceUri"
+        Invoke-WebRequest -Uri $ZlibSourceUri -OutFile $archive
+
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+        if ($hash -ne $ZlibSourceSha256) {
+            throw "zlib source checksum mismatch: expected $ZlibSourceSha256 but got $hash"
+        }
+
+        $extractRoot = Join-Path $work "source"
+        New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+        & tar -xzf $archive -C $extractRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Extracting the zlib source failed with exit code $LASTEXITCODE."
+        }
+
+        $zlibSource = Join-Path $extractRoot "zlib-$ZlibVersion"
+        if (-not (Test-Path -LiteralPath (Join-Path $zlibSource "zlib.h"))) {
+            throw "Unexpected zlib source layout, zlib.h not found under: $zlibSource"
+        }
+
+        $buildDir = Join-Path $work "build"
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $output = Join-Path $buildDir "zlibwapi.dll"
+
+        # Compile through a batch file: cl and link need the environment that
+        # vcvars64.bat sets up, and cmd keeps the quoting readable.
+        $sourceArgs = ($ZlibCompileUnits | ForEach-Object { "`"$zlibSource\$_.c`"" }) -join " "
+        $objectArgs = ($ZlibCompileUnits | ForEach-Object { "$_.obj" }) -join " "
+        $batch = @(
+            "@echo off",
+            "call `"$vcvars`" >nul",
+            "if errorlevel 1 exit /b 1",
+            "cd /d `"$buildDir`"",
+            "cl /nologo /O2 /MD /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE /I`"$zlibSource`" /c $sourceArgs",
+            "if errorlevel 1 exit /b 2",
+            "link /nologo /DLL /INCREMENTAL:NO /DEF:`"$defFile`" /OUT:`"$output`" $objectArgs",
+            "if errorlevel 1 exit /b 3"
+        ) -join "`r`n"
+        $batchPath = Join-Path $work "build-zlibwapi.cmd"
+        Set-Content -LiteralPath $batchPath -Value $batch -Encoding ASCII
+
+        Write-Host "Compiling zlibwapi.dll from official zlib $ZlibVersion source..."
+        & cmd.exe /c $batchPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Building zlibwapi.dll failed with exit code $LASTEXITCODE."
+        }
+        if (-not (Test-Path -LiteralPath $output)) {
+            throw "zlibwapi.dll was not produced at $output"
+        }
+
+        # Export ordinals are an ABI contract with cuDNN: a DLL that merely loads
+        # but resolves the wrong functions corrupts memory instead of failing.
+        & $PythonExe $verifier $output
+        if ($LASTEXITCODE -ne 0) {
+            throw "zlibwapi.dll failed the cuDNN ordinal check."
+        }
+
+        Copy-Item -LiteralPath $output -Destination (Join-Path $SeedRoot "zlibwapi.dll") -Force
+        Write-Host "Installed zlibwapi.dll into the bundled Python seed."
+    }
+    finally {
+        if (Test-Path -LiteralPath $work) {
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 $root = Resolve-RepoRoot
 $python = (Get-Command $PythonPath -CommandType Application -ErrorAction Stop |
     Select-Object -First 1).Source
@@ -285,6 +410,7 @@ if (-not $bundledPython.StartsWith($runnerTemp, [System.StringComparison]::Ordin
     throw "Bundled Python must be prepared inside RUNNER_TEMP: $bundledPython"
 }
 Normalize-BundledPythonSeed -SeedRoot $bundledPython
+Install-ZlibWapiDll -SeedRoot $bundledPython -RepoRoot $root -PythonExe $python
 
 $isccCandidates = @()
 if ($InnoCompiler) {

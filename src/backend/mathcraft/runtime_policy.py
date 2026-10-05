@@ -190,8 +190,16 @@ def cuda_dll_requirements(cuda_info: CudaRuntimeInfo | None = None) -> tuple[Dll
     major = info.major
 
     if major == 11:
+        # cuDNN 8 splits its convolver/ops kernels into sibling DLLs that are
+        # loaded lazily on first use, and on Windows those siblings import
+        # zlibwapi.dll. Checking only cudnn64_8.dll passes on a host where the
+        # first convolution still fails to load, so the whole cuDNN 8 set is
+        # listed here.
         return (
             _exact_req("cudnn", "cudnn64_8.dll"),
+            _exact_req("cudnn", "cudnn_cnn_infer64_8.dll"),
+            _exact_req("cudnn", "cudnn_ops_infer64_8.dll"),
+            _exact_req("zlib", "zlibwapi.dll"),
             _exact_req("cuda-runtime", "cudart64_110.dll"),
             _exact_req("cublas", "cublas64_11.dll"),
             _exact_req("cublaslt", "cublasLt64_11.dll"),
